@@ -1,0 +1,499 @@
+trigger:
+  branches:
+    include:
+      - "develop"
+      - "qa"
+      - "master"
+
+pr:
+  branches:
+    include:
+      - "develop"
+      - "qa"
+      - "master"
+
+variables:
+  serviceName: pa-authz
+
+pool:
+  name: Default
+  demands:
+    - agent.name -equals selfhostedagentvm
+
+stages:
+  - stage: CI
+    displayName: Continuous Integration
+    condition: |
+      and(
+         succeeded(),
+         or(
+           eq(variables['Build.Reason'], 'PullRequest'),
+           eq(variables['Build.SourceBranch'], 'refs/heads/develop'),
+           eq(variables['Build.SourceBranch'], 'refs/heads/master'),
+           eq(variables['Build.SourceBranch'], 'refs/heads/qa')
+      ))
+    jobs:
+      - job: SonarCloudAnalysis
+        displayName: "Pipeline Start"
+        steps:
+          - script: rm -rf ~/.sonar/cache
+            displayName: "Cleanup Sonar Cache"
+
+          - task: SonarSource.sonarcloud.14d9cde6-c1da-4d55-aa01-2965cd301255.SonarCloudPrepare@1
+            displayName: "SonarCloud Begin"
+            inputs:
+              SonarCloud: "new-service"
+              organization: kartikindia29
+              scannerMode: CLI
+              configMode: manual
+              cliProjectKey: "kartikindia_pa-authz"
+              cliProjectName: "kartikindia_pa-authz"
+              extraProperties: |
+                sonar.sources=src
+                sonar.exclusions=**/*.js,HelmChart/**,**/db.ts,**/index.ts,**/appConstants.ts,**/awthJwt.ts,**/*.router.ts,**/helpers/*.ts,**/config/**.ts,**/models/*.ts,**/*.route.ts
+                sonar.sourceEncoding=UTF-8
+                sonar.tests=tests
+                sonar.test.inclusions=**/*.test.js
+                sonar.javascript.lcov.reportPaths=coverage/lcov.info
+                sonar.qualitygate.wait=true
+                sonar.host.connectTimeout=600
+                sonar.host.readTimeout=1200
+                sonar.verbose=true
+                sonar.javascript.node.maxspace=102400
+                sonar.log.level=DEBUG
+            continueOnError: false
+
+          - checkout: self
+            displayName: "Pull from GitHub repo"
+            continueOnError: false
+
+          - task: UseNode@1
+            displayName: "Install Node.js"
+            inputs:
+              version: "16"
+
+          - script: |
+              echo "Building your project..."
+              npm install
+              if [ -n "$SYSTEM_PULLREQUEST_TARGETBRANCH" ]; then
+                # Pull request detected, use target branch
+                TARGET_BRANCH="$SYSTEM_PULLREQUEST_TARGETBRANCH"
+                echo "Pull request detected, target branch: $TARGET_BRANCH"
+              else
+                # Direct branch build, use source branch
+                TARGET_BRANCH=$(echo "$BUILD_SOURCEBRANCH" | sed 's|refs/heads/||')
+                echo "No pull request, using source branch: $TARGET_BRANCH"
+              fi
+
+              if [ "$TARGET_BRANCH" == "develop" ]; then
+                echo "Running build for DEV environment"
+                npm run build:dev
+              elif [ "$TARGET_BRANCH" == "qa" ]; then
+                echo "Running build for QA environment"
+                npm run build:staging
+              elif [ "$TARGET_BRANCH" == "master" ]; then
+                echo "Running build for PROD environment"
+                npm run build:production
+              else
+                echo "$SYSTEM_PULLREQUEST_TARGETBRANCH No matching environment. Exiting..."
+                exit 1
+              fi
+            displayName: "Build"
+            continueOnError: false
+
+          - script: |
+              echo "Installing ESLint & Prettier..."
+              npm install eslint prettier --save-dev
+              echo "Running ESLint..."
+              npm run lint .
+              echo "Running Prettier..."
+              npm run prettier
+            displayName: "Install ESLint & Prettier"
+            continueOnError: false
+
+          - script: |
+              echo "Running tests and generating coverage report..."
+              npm install
+              npm run test -- --coverage
+            displayName: Run tests and generate coverage report
+            continueOnError: false
+
+          - script: ls -R coverage
+            displayName: "List coverage directory contents"
+            continueOnError: false
+
+          # - task: SonarSource.sonarcloud.ce096e50-6155-4de8-8800-4221aaeed4a1.SonarCloudAnalyze@1
+          #   displayName: 'Run SonarCloud Analysis'
+          #   inputs:
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: "$(System.DefaultWorkingDirectory)/HelmChart"
+              artifactName: "HelmChart"
+              publishLocation: "Container"
+              continueOnError: false
+
+  - stage: Build
+    displayName: Build
+    dependsOn: CI
+    condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/qa'), eq(variables['Build.SourceBranch'], 'refs/heads/master')))
+    jobs:
+      - job: Build_And_Scan_Dev
+        displayName: Build and Scan - Dev
+        condition: eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+        steps:
+          - script: |
+              # Build the image locally first without pushing
+              docker build -f Dockerfile.dev -t cax_pa-authz_dev:$(Build.BuildId) .
+            displayName: Build Docker Image - Dev
+
+         
+
+          - task: Docker@2
+            displayName: "Build and Push - Dev"
+            inputs:
+              containerRegistry: "caxdevacrpa0"
+              repository: "cax_pa-authz_dev"
+              command: buildAndPush
+              Dockerfile: Dockerfile.dev
+              tags: "$(Build.BuildId)"
+            condition: succeeded()
+
+      - job: Build_and_Scan_QA
+        displayName: Build and Scan - QA
+        condition: eq(variables['Build.SourceBranch'], 'refs/heads/qa')
+        steps:
+          - script: |
+              # Build the image locally first without pushing
+              docker build -f Dockerfile.qa -t cax_pa-authz_qa:$(Build.BuildId) .
+            displayName: Build Docker Image - QA
+
+          - script: |
+              # Install Trivy
+              sudo apt-get update
+              sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+              wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+              echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+              sudo apt-get update
+              sudo apt-get install -y trivy
+
+              # Scan the image with Trivy and save results
+              trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress cax_pa-authz_qa:$(Build.BuildId)
+
+              # Store the exit code to determine if vulnerabilities were found
+              SCAN_EXIT_CODE=$?
+
+              # Save the exit code to a file for later use
+              echo $SCAN_EXIT_CODE > trivy-scan-exit-code.txt
+
+              # Generate HTML report regardless of findings
+              mkdir -p trivy-reports
+              trivy image --format template --template "@/usr/local/share/trivy/templates/html.tpl" -o trivy-reports/qa-scan-results.html cax_pa-authz_qa:$(Build.BuildId)
+
+              # Exit with 0 to allow the pipeline to continue
+              exit 0
+            displayName: Scan Image with Trivy - QA
+            continueOnError: true # We'll decide whether to proceed in the next step
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: trivy-reports
+              artifactName: TrivyReports-QA
+              publishLocation: Container
+            displayName: Publish Trivy Scan Results - QA
+            condition: always()
+
+          - script: |
+              # Check for HIGH or CRITICAL vulnerabilities
+              SCAN_EXIT_CODE=$(cat trivy-scan-exit-code.txt || echo 1)
+              if [ "$SCAN_EXIT_CODE" -ne 0 ]; then
+                echo "##vso[task.logissue type=error]HIGH or CRITICAL vulnerabilities found in the Docker image. Deployment halted."
+                echo "##vso[task.complete result=Failed;]"
+                exit 1
+              else
+                echo "No HIGH or CRITICAL vulnerabilities found. Proceeding with deployment."
+              fi
+            displayName: Evaluate Scan Results - QA
+            condition: always()
+
+          # First scan for secrets with Gitleaks before building Docker image
+          - script: |
+              # Install Gitleaks
+              curl -L https://github.com/zricethezav/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz -o gitleaks.tar.gz
+              tar -xzf gitleaks.tar.gz
+              chmod +x gitleaks
+              sudo mv gitleaks /usr/local/bin/
+
+              # Run Gitleaks scan
+              mkdir -p gitleaks-reports/qa
+              echo "Running Gitleaks scan to detect secrets..."
+
+              # Run Gitleaks and capture the exit code
+              gitleaks detect --source . --report-format json --report-path gitleaks-reports/qa/gitleaks-report.json
+              GITLEAKS_EXIT_CODE=$?
+
+              # Also generate a SARIF report for better visualization
+              gitleaks detect --source . --report-format sarif --report-path gitleaks-reports/qa/gitleaks-report.sarif || true
+
+              # Check if any secrets were found
+              if [ $GITLEAKS_EXIT_CODE -ne 0 ]; then
+                echo "##vso[task.logissue type=error]Secrets were found in the repository!"
+                echo "Please review the report for details."
+                cat gitleaks-reports/qa/gitleaks-report.json
+                echo "##vso[task.complete result=Failed;]Security scan failed. Pipeline halted due to detected secrets."
+                exit 1
+              else
+                echo "No secrets were found in the repository. Proceeding with the build."
+              fi
+            displayName: "Scan for secrets with Gitleaks - QA"
+            continueOnError: false # Fail the pipeline if secrets are found
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: gitleaks-reports/qa
+              artifactName: GitleaksReports-QA
+              publishLocation: Container
+            displayName: Publish Gitleaks Scan Results - QA
+            condition: always()
+
+          - task: Docker@2
+            displayName: Build and Push - QA
+            inputs:
+              containerRegistry: "caxqaacrpa00"
+              repository: "cax_pa-authz_qa"
+              command: buildAndPush
+              Dockerfile: Dockerfile.qa
+              tags: "$(Build.BuildId)"
+            condition: succeeded()
+
+      - job: Build_and_Scan_Prod
+        displayName: Build and Scan - Prod
+        condition: eq(variables['Build.SourceBranch'], 'refs/heads/master')
+        steps:
+          - script: |
+              # Build the image locally first without pushing
+              docker build -f Dockerfile.prod -t cax_pa-authz_prod:$(Build.BuildId) .
+            displayName: Build Docker Image - Prod
+
+          - script: |
+              # Install Trivy
+              sudo apt-get update
+              sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+              wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+              echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+              sudo apt-get update
+              sudo apt-get install -y trivy
+
+              # Scan the image with Trivy and save results
+              trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress cax_pa-authz_prod:$(Build.BuildId)
+
+              # Store the exit code to determine if vulnerabilities were found
+              SCAN_EXIT_CODE=$?
+
+              # Save the exit code to a file for later use
+              echo $SCAN_EXIT_CODE > trivy-scan-exit-code.txt
+
+              # Generate HTML report regardless of findings
+              mkdir -p trivy-reports
+              trivy image --format template --template "@/usr/local/share/trivy/templates/html.tpl" -o trivy-reports/prod-scan-results.html cax_pa-authz_prod:$(Build.BuildId)
+
+              # Exit with 0 to allow the pipeline to continue
+              exit 0
+            displayName: Scan Image with Trivy - Prod
+            continueOnError: true # We'll decide whether to proceed in the next step
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: trivy-reports
+              artifactName: TrivyReports-Prod
+              publishLocation: Container
+            displayName: Publish Trivy Scan Results - Prod
+            condition: always()
+
+          - script: |
+              # Check for HIGH or CRITICAL vulnerabilities
+              SCAN_EXIT_CODE=$(cat trivy-scan-exit-code.txt || echo 1)
+              if [ "$SCAN_EXIT_CODE" -ne 0 ]; then
+                echo "##vso[task.logissue type=error]HIGH or CRITICAL vulnerabilities found in the Docker image. Deployment halted."
+                echo "##vso[task.complete result=Failed;]"
+                exit 1
+              else
+                echo "No HIGH or CRITICAL vulnerabilities found. Proceeding with deployment."
+              fi
+            displayName: Evaluate Scan Results - Prod
+            condition: always()
+
+          # First scan for secrets with Gitleaks before building Docker image
+          - script: |
+              # Install Gitleaks
+              curl -L https://github.com/zricethezav/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz -o gitleaks.tar.gz
+              tar -xzf gitleaks.tar.gz
+              chmod +x gitleaks
+              sudo mv gitleaks /usr/local/bin/
+
+              # Run Gitleaks scan
+              mkdir -p gitleaks-reports/prod
+              echo "Running Gitleaks scan to detect secrets..."
+
+              # Run Gitleaks and capture the exit code
+              gitleaks detect --source . --report-format json --report-path gitleaks-reports/prod/gitleaks-report.json
+              GITLEAKS_EXIT_CODE=$?
+
+              # Also generate a SARIF report for better visualization
+              gitleaks detect --source . --report-format sarif --report-path gitleaks-reports/prod/gitleaks-report.sarif || true
+
+              # Check if any secrets were found
+              if [ $GITLEAKS_EXIT_CODE -ne 0 ]; then
+                echo "##vso[task.logissue type=error]Secrets were found in the repository!"
+                echo "Please review the report for details."
+                cat gitleaks-reports/prod/gitleaks-report.json
+                echo "##vso[task.complete result=Failed;]Security scan failed. Pipeline halted due to detected secrets."
+                exit 1
+              else
+                echo "No secrets were found in the repository. Proceeding with the build."
+              fi
+            displayName: "Scan for secrets with Gitleaks - Prod"
+            continueOnError: false # Fail the pipeline if secrets are found
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: gitleaks-reports/prod
+              artifactName: GitleaksReports-Prod
+              publishLocation: Container
+            displayName: Publish Gitleaks Scan Results - Prod
+            condition: always()
+
+          - task: Docker@2
+            displayName: "Build and Push - Prod"
+            inputs:
+              containerRegistry: "caxprodacrpa00"
+              repository: "cax_pa-authz_prod"
+              command: buildAndPush
+              Dockerfile: Dockerfile.prod
+              tags: "$(Build.BuildId)"
+            condition: succeeded()
+
+      - job: Install_Helm
+        displayName: Install_Helm
+        steps:
+          - task: HelmInstaller@1
+            displayName: Install Helm
+            inputs:
+              version: latest
+
+  - stage: DeployToKubernetesDev
+    displayName: "Deploy to Kubernetes - Dev"
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - deployment: DeployToKubernetesDev
+        displayName: Deploy to Kubernetes - Dev
+        environment: Dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    buildType: "current"
+                    artifactName: "HelmChart"
+
+                - task: CopyFiles@2
+                  displayName: "Copy HelmChart Folder to Default Working Directory"
+                  inputs:
+                    SourceFolder: "$(Pipeline.Workspace)/HelmChart"
+                    TargetFolder: "$(System.DefaultWorkingDirectory)"
+                    Contents: "**"
+
+                - task: HelmDeploy@0
+                  displayName: "Helm Upgrade - Dev"
+                  inputs:
+                    connectionType: "Azure Resource Manager"
+                    azureSubscription: "Tatatele-Caxsol"
+                    azureResourceGroup: "cax_peopleanalytics_rg"
+                    kubernetesCluster: "caxallenvakspa01"
+                    namespace: "people-analytics-dev"
+                    command: "upgrade"
+                    chartType: "FilePath"
+                    chartPath: "$(System.DefaultWorkingDirectory)/pa-authz-chart"
+                    releaseName: "pa-authz-dev"
+                    overrideValues: "image.tag=$(Build.BuildId)"
+                    valueFile: "$(System.DefaultWorkingDirectory)/values-dev.yaml"
+
+  - stage: DeployToKubernetesQA
+    displayName: "Deploy to Kubernetes - QA"
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/qa'))
+    jobs:
+      - deployment: DeployToKubernetesQA
+        displayName: Deploy to Kubernetes - QA
+        environment: QA
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    buildType: "current"
+                    artifactName: "HelmChart"
+
+                - task: CopyFiles@2
+                  displayName: "Copy HelmChart Folder to Default Working Directory"
+                  inputs:
+                    SourceFolder: "$(Pipeline.Workspace)/HelmChart"
+                    TargetFolder: "$(System.DefaultWorkingDirectory)"
+                    Contents: "**"
+
+                - task: HelmDeploy@0
+                  displayName: "Helm Upgrade - QA"
+                  inputs:
+                    connectionType: "Azure Resource Manager"
+                    azureSubscription: "Tatatele-Caxsol"
+                    azureResourceGroup: "cax_peopleanalytics_rg"
+                    kubernetesCluster: "caxallenvakspa01"
+                    namespace: "people-analytics-qa"
+                    command: "upgrade"
+                    chartType: "FilePath"
+                    chartPath: "$(System.DefaultWorkingDirectory)/pa-authz-chart"
+                    releaseName: "people-analytics-pa-authz-qa"
+                    overrideValues: "image.tag=$(Build.BuildId)"
+                    valueFile: "$(System.DefaultWorkingDirectory)/values-qa.yaml"
+
+  - stage: DeployToKubernetesProd
+    displayName: "Deploy to Kubernetes - Prod"
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+    jobs:
+      - deployment: DeployToKubernetesProd
+        displayName: Deploy to Kubernetes - Prod
+        environment: Prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    buildType: "current"
+                    artifactName: "HelmChart"
+
+                - task: CopyFiles@2
+                  displayName: "Copy HelmChart Folder to Default Working Directory"
+                  inputs:
+                    SourceFolder: "$(Pipeline.Workspace)/HelmChart"
+                    TargetFolder: "$(System.DefaultWorkingDirectory)"
+                    Contents: "**"
+
+                - task: HelmDeploy@0
+                  displayName: "Helm Upgrade - Prod"
+                  inputs:
+                    connectionType: "Azure Resource Manager"
+                    azureSubscription: "Tatatele-Caxsol"
+                    azureResourceGroup: "cax_peopleanalytics_rg"
+                    kubernetesCluster: "caxallenvakspa01"
+                    namespace: "people-analytics-prod"
+                    command: "upgrade"
+                    chartType: "FilePath"
+                    chartPath: "$(System.DefaultWorkingDirectory)/pa-authz-chart"
+                    releaseName: "pa-authz-prod"
+                    overrideValues: "image.tag=$(Build.BuildId)"
+                    valueFile: "$(System.DefaultWorkingDirectory)/values-prod.yaml"

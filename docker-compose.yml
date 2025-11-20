@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  auth-service:
+    container_name: auth-service
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_ENV: ${ENVIRONMENT} # ENVIRONMENT=dev|staging|production
+    ports:
+      - "${PORT}:${PORT}" # PORT comes from .env
+    env_file:
+      - .env # Inject all secrets
+    environment:
+      - NODE_ENV=${ENVIRONMENT} # Used by appConstants
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: >
+      sh -c "
+      if [ '${ENVIRONMENT}' = 'production' ]; then
+        npm run start:production;
+      elif [ '${ENVIRONMENT}' = 'staging' ]; then
+        npm run start:staging;
+      else
+        npm run start:dev;
+      fi"
