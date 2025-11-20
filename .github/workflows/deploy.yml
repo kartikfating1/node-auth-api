@@ -37,7 +37,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t $ECR_REPO:$IMAGE_TAG .
+          docker build -t $ECR_REPO:$IMAGE_TAG -f Dockerfile .
 
       - name: Tag Docker image for ECR
         run: |
@@ -52,16 +52,11 @@ jobs:
           mkdir -p $HOME/.kube
           echo "${{ secrets.KUBE_CONFIG }}" | base64 --decode > $HOME/.kube/config
           chmod 600 $HOME/.kube/config
-        # If you prefer isolated kubeconfig file:
-        # run: |
-        #   echo "${{ secrets.KUBE_CONFIG }}" | base64 --decode > kubeconfig
-        #   export KUBECONFIG=$PWD/kubeconfig
 
-      - name: Verify cluster (optional)
+      - name: Verify cluster
         run: |
-          kubectl version --client
-          kubectl get nodes --request-timeout=20s || true
-          kubectl get ns || true
+          kubectl get nodes --request-timeout=10s
+          kubectl get ns
 
       - name: Update K8s Deployment image
         run: |
