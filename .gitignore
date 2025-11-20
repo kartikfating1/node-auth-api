@@ -2,7 +2,6 @@ node_modules
 logs
 HelmChart
 .env
-Dockerfile
 .idea
 dist
 coverage
