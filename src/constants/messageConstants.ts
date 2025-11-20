@@ -19,7 +19,7 @@ export const messageConstants = {
     UNREGISTRED_USER: "This Email-Id is not registered!",
     INVALID_PASSWORD: "Invalid Password!",
     BEFORE_DELETE_ROLE:
-      "This user role is in use, please delete the user first",
+      "This user role is in use, please delete the user firsts",
   },
   failure: {
     SERVER_FAIL: "Failed to start server:",
